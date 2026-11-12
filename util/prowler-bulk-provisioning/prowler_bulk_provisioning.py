@@ -492,11 +492,11 @@ def create_one(
         data = {"text": resp.text}
 
     if resp.status_code == 409 and update_if_exists:
-        print(f" ℹ  Provider exists, try to update: {provider}/{uid} ({alias})")
+        print(f"[?] ℹ  Provider exists, try to update: {provider}/{uid} ({alias})")
 
         provider_id = find_existing_provider(client, provider, uid)
         if not provider_id:
-            print(f" ⚠️  Provider {provider}/{uid} ({alias}) exists but could not be found for update")
+            print(f"[?] ⚠️  Provider {provider}/{uid} ({alias}) exists but could not be found for update")
             return False, {
                 "status": 409,
                 "body": data,
@@ -564,7 +564,7 @@ def create_one(
                 },
             )
             result["secret_action"] = "updated"
-            print(f" ✅ Updated secret 1 of provider (id={provider_id})")
+            print(f"[?] ✅ Updated secret 1 of provider (id={provider_id})")
         else:
             # POST to /providers/secrets endpoint
             secret_resp = client.post("/providers/secrets", secret_payload)
@@ -627,7 +627,7 @@ def test_provider_connection(client: ApiClient, provider_id: str) -> Dict[str, A
 
 def find_existing_provider(client: ApiClient, provider: str, uid: str) -> Optional[str]:
     """Find an existing provider by provider type and UID."""
-    #print(f" ℹ Searching for existing provider... {uid}")
+    #print(f"[?] ℹ Searching for existing provider... {uid}")
 
     try:
         # Query for the specific provider
@@ -643,7 +643,7 @@ def find_existing_provider(client: ApiClient, provider: str, uid: str) -> Option
 
 def find_provider_secrets(client: ApiClient, provider_id: str) -> List[Dict[str, Any]]:
     """Return the list of secrets linked to a provider."""
-    print(f" ! Searching for existing secrets of provider... {provider_id}")
+    # print(f"[?] ! Searching for existing secrets of provider... {provider_id}")
     try:
         resp = client.get(f"/providers/secrets?filter[provider]={provider_id}")
         if resp.status_code == 200:
