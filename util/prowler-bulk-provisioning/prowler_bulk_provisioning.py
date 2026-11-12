@@ -11,7 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import requests
 
@@ -431,6 +431,18 @@ class ApiClient:
         )
 
 
+    def patch(self, path: str, json_body: Dict[str, Any]) -> requests.Response:
+        """Make PATCH request to API endpoint."""
+        url = f"{self.base_url}{path}"
+        return requests.patch(
+            url,
+            headers=self._headers(),
+            json=json_body,
+            timeout=self.timeout,
+            verify=self.verify_ssl,
+        )
+
+
 def with_retries(
     func, *, retries=4, base_delay=1.25, exceptions=(requests.RequestException,)
 ):
@@ -458,8 +470,20 @@ def create_one(
     provider_payload: Dict[str, Any],
     secret_payload: Optional[Dict[str, Any]] = None,
     test_provider: bool = False,
+    update_if_exists: bool = True,
 ) -> Tuple[bool, Dict[str, Any]]:
-    """Create a single provider with optional secret using two-step process."""
+    """
+    Create a single provider with optional secret using two-step process.
+
+    If update_if_exists is True and the provider already exists (HTTP 409),
+    the existing provider's alias is updated instead of failing.
+    """
+    attributes = provider_payload["data"]["attributes"]
+    provider = attributes["provider"]
+    uid = attributes["uid"]
+    alias = attributes.get("alias")
+    provider_was_updated = False
+
     # Step 1: Create provider
     resp = client.post(provider_endpoint, provider_payload)
     try:
@@ -467,36 +491,99 @@ def create_one(
     except ValueError:
         data = {"text": resp.text}
 
-    if not (200 <= resp.status_code < 300):
-        return False, {"status": resp.status_code, "body": data, "step": "provider"}
+    if resp.status_code == 409 and update_if_exists:
+        print(f" ℹ  Provider exists, try to update: {provider}/{uid} ({alias})")
 
-    provider_id = data.get("data", {}).get("id")
-    if not provider_id:
-        return False, {"error": "No provider ID returned", "body": data}
+        provider_id = find_existing_provider(client, provider, uid)
+        if not provider_id:
+            print(f" ⚠️  Provider {provider}/{uid} ({alias}) exists but could not be found for update")
+            return False, {
+                "status": 409,
+                "body": data,
+                "step": "provider",
+                "error": "Provider exists but could not be found for update",
+            }
+
+        update_attributes = {"alias": alias} if alias else {}
+        update_resp = client.patch(
+            f"/providers/{provider_id}",
+            {
+                "data": {
+                    "type": "providers",
+                    "id": provider_id,
+                    "attributes": update_attributes,
+                }
+            },
+        )
+        try:
+            data = update_resp.json()
+        except ValueError:
+            data = {"text": update_resp.text}
+
+        if not (200 <= update_resp.status_code < 300):
+            print(f" ⚠️  Provider {provider}/{uid} ({alias}) exists but could not be updated ({data})")
+            return False, {
+                "status": update_resp.status_code,
+                "body": data,
+                "step": "provider_update",
+            }
+        provider_was_updated = True
+        print(f"[?] ✅ Updated provider (id={provider_id})")
+    elif not (200 <= resp.status_code < 300):
+        return False, {"status": resp.status_code, "body": data, "step": "provider"}
+    else:
+        provider_id = data.get("data", {}).get("id")
+        if not provider_id:
+            return False, {"error": "No provider ID returned", "body": data}
 
     result = {"provider": data}
 
-    # Step 2: Create secret if provided
+    # Step 2: Create or update secret if provided
     if secret_payload:
         # Update the provider ID in the secret payload
         secret_payload["data"]["relationships"]["provider"]["data"]["id"] = provider_id
+        secret_attributes = secret_payload["data"]["attributes"]
 
-        # POST to /providers/secrets endpoint
-        secret_resp = client.post("/providers/secrets", secret_payload)
+        # With update_if_exists, list the provider's secrets and update the first one
+        existing_secret_id = None
+        if update_if_exists:
+            secrets = find_provider_secrets(client, provider_id)
+            if secrets:
+                existing_secret_id = secrets[0].get("id")
+
+        if existing_secret_id:
+            # print(f" ℹ Try to update secret 1 of provider {provider_id}")
+            secret_resp = client.patch(
+                f"/providers/secrets/{existing_secret_id}",
+                {
+                    "data": {
+                        "type": "provider-secrets",
+                        "id": existing_secret_id,
+                        "attributes": secret_attributes,
+                    }
+                },
+            )
+            result["secret_action"] = "updated"
+            print(f" ✅ Updated secret 1 of provider (id={provider_id})")
+        else:
+            # POST to /providers/secrets endpoint
+            secret_resp = client.post("/providers/secrets", secret_payload)
+            result["secret_action"] = "created"
+
         try:
-            secret_data = secret_resp.json()
+            secret_resp_data = secret_resp.json()
         except ValueError:
-            secret_data = {"text": secret_resp.text}
+            secret_resp_data = {"text": secret_resp.text}
 
         if not (200 <= secret_resp.status_code < 300):
-            # Provider was created but secret failed
+            # Provider was created/updated but secret failed
             result["secret_error"] = {
                 "status": secret_resp.status_code,
-                "body": secret_data,
+                "body": secret_resp_data,
             }
             return False, result
 
-        result["secret"] = secret_data
+        result["secret"] = secret_resp_data
 
     # Step 3: Test connection if requested
     if test_provider:
@@ -540,6 +627,8 @@ def test_provider_connection(client: ApiClient, provider_id: str) -> Dict[str, A
 
 def find_existing_provider(client: ApiClient, provider: str, uid: str) -> Optional[str]:
     """Find an existing provider by provider type and UID."""
+    #print(f" ℹ Searching for existing provider... {uid}")
+
     try:
         # Query for the specific provider
         resp = client.get(f"/providers?filter[provider]={provider}&filter[uid]={uid}")
@@ -551,6 +640,17 @@ def find_existing_provider(client: ApiClient, provider: str, uid: str) -> Option
     except Exception:
         pass
     return None
+
+def find_provider_secrets(client: ApiClient, provider_id: str) -> List[Dict[str, Any]]:
+    """Return the list of secrets linked to a provider."""
+    print(f" ! Searching for existing secrets of provider... {provider_id}")
+    try:
+        resp = client.get(f"/providers/secrets?filter[provider]={provider_id}")
+        if resp.status_code == 200:
+            return resp.json().get("data", []) or []
+    except Exception:
+        pass
+    return []
 
 
 # ----------------------------- main ---------------------------------------- #
